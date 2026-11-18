@@ -1081,9 +1081,18 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
         // We deliberately exclude src tensor dimensions from the key because:
         // 1. For CPU backends, alloc_size = ggml_nbytes(output) regardless of src shapes
         // 2. For GPU backends, the reservation graph uses max dimensions, so the
-        //    cached value from reservation is always >= any subsequent request
+        //    cached value from reservation is usually >= any subsequent request
         // 3. Including src dims causes cache misses per-ubatch (e.g. growing KV cache)
         //    which blocks the main thread behind in-flight GRAPH_COMPUTE commands
+        //
+        // Assumption 2 does not hold for every op: some ops (e.g. TOP_K) size their
+        // output as a function of a src's shape rather than the output's own dims, so
+        // a size cached while a src was small must not be reused once that src grows
+        // past what was cached. We track, per src, the largest dims seen under this
+        // key and only serve the cached size while every current src dim is no larger;
+        // otherwise we requery and grow the recorded maximums. The requeried size is an
+        // upper bound for every smaller src already covered, so one growing high-water
+        // mark per key is enough -- it never needs to shrink back down.
         struct alloc_size_cache_key {
             uint32_t device;
             uint32_t type;
@@ -1106,17 +1115,42 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
         uint64_t cache_hash = fnv_hash((const uint8_t *)&key, sizeof(key));
         cache_hash = fnv_hash((const uint8_t *)buft_ctx->endpoint.data(), buft_ctx->endpoint.size(), cache_hash);
 
-        // alloc sizes are immutable for a given tensor configuration
+        int64_t src_ne[GGML_MAX_SRC][GGML_MAX_DIMS];
+        for (int i = 0; i < GGML_MAX_SRC; i++) {
+            for (int d = 0; d < GGML_MAX_DIMS; d++) {
+                src_ne[i][d] = tensor->src[i] ? tensor->src[i]->ne[d] : 0;
+            }
+        }
+
+        // alloc sizes are cached per key, but must be requeried if a src outgrows
+        // the largest dims seen so far under that key (see comment above)
+        struct alloc_size_cache_entry {
+            size_t  alloc_size;
+            int64_t max_src_ne[GGML_MAX_SRC][GGML_MAX_DIMS];
+        };
         static std::mutex cache_mutex;
-        static std::unordered_map<uint64_t, size_t> cache;
+        static std::unordered_map<uint64_t, alloc_size_cache_entry> cache;
 
         {
             std::lock_guard<std::mutex> lock(cache_mutex);
             auto it = cache.find(cache_hash);
             if (it != cache.end()) {
-                LOG_DBG3("[%s] cache hit: %s -> %s\n", __func__, rpc_log_format_tensor(tensor).c_str(),
-                         rpc_log_format_size(it->second).c_str());
-                return std::max<size_t>(it->second, min_size);
+                bool src_grew = false;
+                for (int i = 0; i < GGML_MAX_SRC && !src_grew; i++) {
+                    for (int d = 0; d < GGML_MAX_DIMS; d++) {
+                        if (src_ne[i][d] > it->second.max_src_ne[i][d]) {
+                            src_grew = true;
+                            break;
+                        }
+                    }
+                }
+                if (!src_grew) {
+                    LOG_DBG3("[%s] cache hit: %s -> %s\n", __func__, rpc_log_format_tensor(tensor).c_str(),
+                             rpc_log_format_size(it->second.alloc_size).c_str());
+                    return std::max<size_t>(it->second.alloc_size, min_size);
+                }
+                LOG_DBG2("[%s] cache stale (src grew): %s, querying server\n", __func__,
+                         rpc_log_format_tensor(tensor).c_str());
             }
         }
 
@@ -1139,7 +1173,13 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
 
         {
             std::lock_guard<std::mutex> lock(cache_mutex);
-            cache[cache_hash] = response.alloc_size;
+            auto & entry = cache[cache_hash];
+            entry.alloc_size = response.alloc_size;
+            for (int i = 0; i < GGML_MAX_SRC; i++) {
+                for (int d = 0; d < GGML_MAX_DIMS; d++) {
+                    entry.max_src_ne[i][d] = std::max(entry.max_src_ne[i][d], src_ne[i][d]);
+                }
+            }
         }
 
         LOG_DBG2("[%s] %s -> alloc_size: %s\n", __func__, rpc_log_format_tensor(tensor).c_str(),

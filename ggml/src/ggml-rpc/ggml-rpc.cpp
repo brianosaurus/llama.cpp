@@ -1078,12 +1078,27 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
         const size_t min_size = ggml_nbytes(tensor);
 
         // Cache key for calls to read the alloc_size.
-        // We deliberately exclude src tensor dimensions from the key because:
-        // 1. For CPU backends, alloc_size = ggml_nbytes(output) regardless of src shapes
-        // 2. For GPU backends, the reservation graph uses max dimensions, so the
-        //    cached value from reservation is always >= any subsequent request
-        // 3. Including src dims causes cache misses per-ubatch (e.g. growing KV cache)
-        //    which blocks the main thread behind in-flight GRAPH_COMPUTE commands
+        // The key itself is based on the output tensor's op/type/shape only (no src
+        // dims), because for most backends/ops that is all that determines alloc_size
+        // and including src dims in the key would cause a cache miss on every ubatch
+        // for ops whose src grows monotonically (e.g. the KV cache).
+        //
+        // However, for ops where get_alloc_size may be a function of the srcs
+        // (ggml_op_alloc_size_may_expand(), e.g. TOP_K, FLASH_ATTN_EXT), a cached size
+        // obtained for a small src must NOT be reused for a larger src of the same op/
+        // output-shape: the server-side allocation can scale with nelements(src), so
+        // reusing a stale smaller size causes a server-side buffer overrun.
+        // See: https://github.com/ggml-org/llama.cpp/issues/30794
+        //
+        // To fix this while still avoiding a cache miss on every ubatch, each cache
+        // entry also records the src dims that were used to obtain its size. A cached
+        // entry is reused only if the current tensor's srcs are no larger, in every
+        // dimension, than the srcs that produced the cached value (the server-side
+        // size is assumed to be monotonic non-decreasing in the src dims, which holds
+        // for all ops currently covered by ggml_op_alloc_size_may_expand()). A request
+        // with a larger src is treated as a cache miss, and the entry is refreshed
+        // with the new (larger) src dims and size, so it becomes the new high-water
+        // mark for subsequent, smaller requests.
         struct alloc_size_cache_key {
             uint32_t device;
             uint32_t type;
@@ -1091,6 +1106,12 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
             int32_t  op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t)];
             uint32_t ne[GGML_MAX_DIMS];
             uint64_t nb[GGML_MAX_DIMS];
+        };
+
+        struct alloc_size_cache_value {
+            size_t   size;
+            // high-water-mark src dims that produced `size`
+            uint64_t src_ne[GGML_MAX_SRC][GGML_MAX_DIMS];
         };
 
         alloc_size_cache_key key = {};
@@ -1106,17 +1127,33 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
         uint64_t cache_hash = fnv_hash((const uint8_t *)&key, sizeof(key));
         cache_hash = fnv_hash((const uint8_t *)buft_ctx->endpoint.data(), buft_ctx->endpoint.size(), cache_hash);
 
-        // alloc sizes are immutable for a given tensor configuration
+        // alloc sizes are immutable for a given tensor configuration *and* src extent
         static std::mutex cache_mutex;
-        static std::unordered_map<uint64_t, size_t> cache;
+        static std::unordered_map<uint64_t, alloc_size_cache_value> cache;
+
+        // does `tensor`'s srcs fit within the high-water-mark src dims recorded in `value`?
+        auto srcs_fit = [&](const alloc_size_cache_value & value) {
+            for (int i = 0; i < GGML_MAX_SRC; i++) {
+                const ggml_tensor * src = tensor->src[i];
+                if (src == nullptr) {
+                    continue;
+                }
+                for (int j = 0; j < GGML_MAX_DIMS; j++) {
+                    if ((uint64_t)src->ne[j] > value.src_ne[i][j]) {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        };
 
         {
             std::lock_guard<std::mutex> lock(cache_mutex);
             auto it = cache.find(cache_hash);
-            if (it != cache.end()) {
+            if (it != cache.end() && srcs_fit(it->second)) {
                 LOG_DBG3("[%s] cache hit: %s -> %s\n", __func__, rpc_log_format_tensor(tensor).c_str(),
-                         rpc_log_format_size(it->second).c_str());
-                return std::max<size_t>(it->second, min_size);
+                         rpc_log_format_size(it->second.size).c_str());
+                return std::max<size_t>(it->second.size, min_size);
             }
         }
 
@@ -1138,8 +1175,33 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
         dispatcher->send(RPC_CMD_GET_ALLOC_SIZE, request, sizeof(*request), nullptr, 0, &response, sizeof(response));
 
         {
+            alloc_size_cache_value value = {};
+            value.size = response.alloc_size;
+            for (int i = 0; i < GGML_MAX_SRC; i++) {
+                const ggml_tensor * src = tensor->src[i];
+                if (src == nullptr) {
+                    continue;
+                }
+                for (int j = 0; j < GGML_MAX_DIMS; j++) {
+                    value.src_ne[i][j] = (uint64_t)src->ne[j];
+                }
+            }
+
             std::lock_guard<std::mutex> lock(cache_mutex);
-            cache[cache_hash] = response.alloc_size;
+            auto it = cache.find(cache_hash);
+            if (it == cache.end()) {
+                cache[cache_hash] = value;
+            } else {
+                // merge: keep the high-water mark for src dims and the size that was
+                // measured for the largest extent seen so far
+                for (int i = 0; i < GGML_MAX_SRC; i++) {
+                    for (int j = 0; j < GGML_MAX_DIMS; j++) {
+                        value.src_ne[i][j] = std::max(value.src_ne[i][j], it->second.src_ne[i][j]);
+                    }
+                }
+                value.size = std::max(value.size, it->second.size);
+                it->second = value;
+            }
         }
 
         LOG_DBG2("[%s] %s -> alloc_size: %s\n", __func__, rpc_log_format_tensor(tensor).c_str(),
